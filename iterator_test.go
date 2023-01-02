@@ -1,13 +1,15 @@
 package iavl
 
 import (
+	"bytes"
 	"math/rand"
 	"sort"
 	"testing"
 
 	dbm "github.com/cosmos/cosmos-db"
-	"github.com/cosmos/iavl/fastnode"
 	"github.com/stretchr/testify/require"
+
+	"github.com/cosmos/iavl/fastnode"
 )
 
 func TestIterator_NewIterator_NilTree_Failure(t *testing.T) {
@@ -159,6 +161,184 @@ func TestIterator_Basic_Full_Descending_Success(t *testing.T) {
 		ascending:      false,
 	}
 	iteratorSuccessTest(t, config)
+}
+
+func mirrorToSlice(mirror map[string]string) [][][]byte {
+	sortedMirror := make([][][]byte, 0, len(mirror))
+	for k, v := range mirror {
+		sortedMirror = append(sortedMirror, [][]byte{[]byte(k), []byte(v)})
+	}
+	sort.Slice(sortedMirror, func(i, j int) bool {
+		return string(sortedMirror[i][0]) < string(sortedMirror[j][0])
+	})
+	return sortedMirror
+}
+
+func TestDifferenceIterator_Basic(t *testing.T) {
+	config := &iteratorTestConfig{
+		startByteToSet: 'a',
+		endByteToSet:   'z',
+		startIterate:   nil,
+		endIterate:     nil,
+		ascending:      true,
+	}
+
+	tree, mirrorA := getRandomizedTreeAndMirror(t)
+	_, vA, err := tree.SaveVersion()
+	require.NoError(t, err)
+
+	// copy the mirror and make changes
+	mirrorB := map[string]string{}
+	for k, v := range mirrorA {
+		mirrorB[k] = v
+	}
+	randomizeTreeAndMirror(t, tree, mirrorB)
+
+	_, vB, err := tree.SaveVersion()
+	require.NoError(t, err)
+
+	// compute expected set differences
+	mirrorBMinusA := map[string]string{}
+	for k, valB := range mirrorB {
+		valA, has := mirrorA[k]
+		if !has || (valA != valB) { // include updated keys
+			mirrorBMinusA[k] = valB
+		}
+	}
+	sortedBMinusA := mirrorToSlice(mirrorBMinusA)
+
+	mirrorAMinusB := map[string]string{}
+	for k, valA := range mirrorA {
+		_, has := mirrorB[k]
+		if !has { // skip updated keys
+			mirrorAMinusB[k] = valA
+		}
+	}
+	sortedAMinusB := mirrorToSlice(mirrorAMinusB)
+
+	treeA, err := tree.GetImmutable(vA)
+	require.NoError(t, err)
+	itA := NewIterator(config.startIterate, config.endIterate, config.ascending, treeA)
+
+	treeB, err := tree.GetImmutable(vB)
+	require.NoError(t, err)
+	itB := NewIterator(config.startIterate, config.endIterate, config.ascending, treeB)
+
+	di := NewDifferenceIterator(itA, itB)
+	require.True(t, di.Valid())
+
+	iOnlyA, iOnlyB := 0, 0
+	for di.Valid() {
+		var expected [][]byte
+		if di.Value() != nil {
+			expected = sortedBMinusA[iOnlyB]
+			iOnlyB++
+			require.Equal(t, []byte(expected[1]), di.Value())
+		} else {
+			expected = sortedAMinusB[iOnlyA]
+			iOnlyA++
+		}
+		require.Equal(t, []byte(expected[0]), di.Key())
+		di.Next()
+		require.NoError(t, di.Error())
+	}
+	require.Equal(t, iOnlyA, len(sortedAMinusB))
+	require.Equal(t, iOnlyB, len(sortedBMinusA))
+
+	// Rebuild A by reversing operations
+
+	di = NewDifferenceIterator(
+		NewIterator(config.startIterate, config.endIterate, config.ascending, treeB),
+		NewIterator(config.startIterate, config.endIterate, config.ascending, treeA),
+	)
+	require.True(t, di.Valid())
+
+	for ; di.Valid(); di.Next() {
+		if di.Value() != nil {
+			tree.Set(di.Key(), di.Value())
+		} else {
+			tree.Remove(di.Key())
+		}
+	}
+
+	_, vC, err := tree.SaveVersion()
+	require.NoError(t, err)
+
+	itA = NewIterator(config.startIterate, config.endIterate, config.ascending, treeA)
+
+	treeC, err := tree.GetImmutable(vC)
+	require.NoError(t, err)
+	itC := NewIterator(config.startIterate, config.endIterate, config.ascending, treeC)
+
+	for i := 0; itA.Valid(); itA.Next() {
+		if !bytes.Equal(itA.Key(), itC.Key()) {
+			_ = i
+		}
+		require.Equal(t, itA.Key(), itC.Key())
+		require.Equal(t, itA.Value(), itC.Value())
+		itC.Next()
+		i++
+
+	}
+	require.False(t, itC.Valid())
+}
+
+func TestPathIterator(t *testing.T) {
+	config := &iteratorTestConfig{
+		startByteToSet: 'a',
+		endByteToSet:   'z',
+		startIterate:   nil,
+		endIterate:     nil,
+		ascending:      false,
+	}
+
+	tree, _ := getRandomizedTreeAndMirror(t)
+	_, version, err := tree.SaveVersion()
+	require.NoError(t, err)
+	immutableTree, err := tree.GetImmutable(version)
+	require.NoError(t, err)
+
+	it := NewPathIterator(config.startIterate, config.endIterate, config.ascending, immutableTree)
+
+	// Reconstruct the tree from the iterated paths
+	var root *Node
+	var cur **Node
+	for ; it.Valid(); it.Next() {
+		// Descend this node's path, building nodes on the way
+		cur = &root
+		if *cur == nil {
+			*cur = NewNode(nil, nil, version)
+		}
+		ancs := []*Node{}
+		for _, childI := range it.Path() {
+			ancs = append(ancs, *cur)
+			if !childI {
+				cur = &(*cur).leftNode
+			} else {
+				cur = &(*cur).rightNode
+			}
+			if *cur == nil {
+				*cur = NewNode(nil, nil, version)
+			}
+		}
+
+		(*cur).key = it.Key()
+		(*cur).value = it.Value()
+
+		// Update ancestor nodes while reascending
+		for len(ancs) > 0 {
+			var anc *Node
+			ancs, anc = ancs[:len(ancs)-1], ancs[len(ancs)-1]
+			anc.calcHeightAndSize(immutableTree)
+		}
+	}
+
+	// Verify the trees are equivalent
+	expected, err := immutableTree.Hash()
+	require.NoError(t, err)
+	actual, _, err := root.hashWithCount()
+	require.NoError(t, err)
+	require.Equal(t, expected, actual)
 }
 
 func TestIterator_WithDelete_Full_Ascending_Success(t *testing.T) {
